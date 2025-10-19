@@ -1,0 +1,14 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: mypod
+spec:
+  os: openbsd           # ошибка: unsupported
+  containers:
+    - name: BadName     # ошибка: не snake_case
+      image: registry.bigbrother.io/app   # ошибка: нет тега
+      ports:
+        - containerPort: "eighty"         # ошибка: must be int
+      resources:
+        limits:
+          memory: "500M"                  # ошибка: формат памяти
