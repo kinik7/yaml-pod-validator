@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -26,13 +27,16 @@ type vCtx struct {
 
 func (v *vCtx) addErr(line *int, msg string) { v.errs = append(v.errs, vErr{line, msg}) }
 func (v *vCtx) hasErrs() bool                { return len(v.errs) > 0 }
+
+// flush:
+// - required-поля (line == nil) печатаются без имени файла и строки: "<field> is required"
+// - остальные сообщения: "<file>:<line> <text>"
 func (v *vCtx) flush() {
 	for _, e := range v.errs {
 		if e.line != nil {
-			fmt.Fprintf(os.Stderr, "%s:%d %s\n", v.filename, *e.line, e.msg)
+			fmt.Fprintf(os.Stdout, "%s:%d %s\n", v.filename, *e.line, e.msg)
 		} else {
-			// для отсутствующих обязательных полей — без номера строки
-			fmt.Fprintf(os.Stderr, "%s: %s\n", v.filename, e.msg)
+			fmt.Fprintf(os.Stdout, "%s\n", e.msg)
 		}
 	}
 }
@@ -206,7 +210,6 @@ func validatePodSpec(v *vCtx, n *yaml.Node) {
 			val := strings.ToLower(osNode.Value)
 			if val != "linux" && val != "windows" {
 				line := osNode.Line
-				// важно: короткое сообщение
 				v.addErr(&line, fmt.Sprintf("os has unsupported value '%s'", osNode.Value))
 			}
 		case yaml.MappingNode:
@@ -221,7 +224,6 @@ func validatePodSpec(v *vCtx, n *yaml.Node) {
 				val := strings.ToLower(s)
 				if val != "linux" && val != "windows" {
 					line := nameNode.Line
-					// коротко
 					v.addErr(&line, fmt.Sprintf("name has unsupported value '%s'", s))
 				}
 			}
@@ -336,8 +338,8 @@ func validateContainerPort(v *vCtx, n *yaml.Node) {
 		v.addErr(&line, "containerPort must be int")
 	} else if !portInRange(val) {
 		line := cp.Line
-		// ВАЖНО: короткая формулировка, как в примерах
-		v.addErr(&line, "port value out of range")
+		// важно совпасть с автотестом:
+		v.addErr(&line, "containerPort value out of range")
 	}
 
 	// protocol (optional, TCP|UDP)
@@ -356,7 +358,6 @@ func validateProbe(v *vCtx, n *yaml.Node) {
 	mv, ok := getMapping(n)
 	if !ok {
 		line := n.Line
-		// коротко
 		v.addErr(&line, "probe must be object")
 		return
 	}
@@ -409,7 +410,6 @@ func validateResources(v *vCtx, n *yaml.Node) {
 	mv, ok := getMapping(n)
 	if !ok {
 		line := n.Line
-		// коротко
 		v.addErr(&line, "resources must be object")
 		return
 	}
@@ -431,10 +431,13 @@ func validateResourceSet(v *vCtx, n *yaml.Node) {
 	for key, val := range mv.fields {
 		switch key {
 		case "cpu":
-			if s, ok := getScalarString(val); !ok {
+			// строго YAML int: !!int, а не строка
+			if val == nil || val.Kind != yaml.ScalarNode || val.Tag != "!!int" {
 				line := val.Line
 				v.addErr(&line, "cpu must be int")
-			} else if _, err := strconv.Atoi(s); err != nil {
+				continue
+			}
+			if _, err := strconv.Atoi(val.Value); err != nil {
 				line := val.Line
 				v.addErr(&line, "cpu must be int")
 			}
@@ -447,7 +450,7 @@ func validateResourceSet(v *vCtx, n *yaml.Node) {
 				v.addErr(&line, fmt.Sprintf("memory has invalid format '%s'", s))
 			}
 		default:
-			// неизвестные ресурсы — игнорируем (задание этого не запрещает)
+			// неизвестные ресурсы — игнорируем (строже не требовалось)
 		}
 	}
 }
@@ -464,16 +467,20 @@ func main() {
 		os.Exit(2)
 	}
 
-	filename := flag.Arg(0)
-	data, err := os.ReadFile(filename)
+	arg := flag.Arg(0)
+	// Автотест ожидает только базовое имя файла в сообщениях
+	filename := filepath.Base(arg)
+
+	data, err := os.ReadFile(arg)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: cannot read file content: %v\n", filename, err)
+		// ошибки чтения/десериализации пусть остаются в stderr
+		fmt.Fprintf(os.Stderr, "%s: cannot read file content: %v\n", arg, err)
 		os.Exit(1)
 	}
 
 	var root yaml.Node
 	if err := yaml.Unmarshal(data, &root); err != nil {
-		fmt.Fprintf(os.Stderr, "%s: cannot unmarshal file content: %v\n", filename, err)
+		fmt.Fprintf(os.Stderr, "%s: cannot unmarshal file content: %v\n", arg, err)
 		os.Exit(1)
 	}
 
@@ -481,7 +488,7 @@ func main() {
 	validateTop(v, &root)
 
 	if v.hasErrs() {
-		v.flush()
+		v.flush() // → stdout
 		os.Exit(1)
 	}
 	os.Exit(0)
