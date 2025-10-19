@@ -12,10 +12,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// -------- инфраструктура ошибок --------
+
 type vErr struct {
 	line *int
 	msg  string
 }
+
 type vCtx struct {
 	filename string
 	errs     []vErr
@@ -28,21 +31,27 @@ func (v *vCtx) flush() {
 		if e.line != nil {
 			fmt.Fprintf(os.Stderr, "%s:%d %s\n", v.filename, *e.line, e.msg)
 		} else {
+			// для отсутствующих обязательных полей — без номера строки
 			fmt.Fprintf(os.Stderr, "%s: %s\n", v.filename, e.msg)
 		}
 	}
 }
 
+// -------- удобный просмотр YAML-мапы --------
+
 type mapView struct {
-	fields map[string]*yaml.Node
-	lines  map[string]int
+	fields map[string]*yaml.Node // key -> value node
+	lines  map[string]int        // key -> keyNode.Line
 }
 
 func viewMap(n *yaml.Node) (*mapView, error) {
 	if n == nil || n.Kind != yaml.MappingNode {
 		return nil, errors.New("expected mapping node")
 	}
-	mv := &mapView{fields: map[string]*yaml.Node{}, lines: map[string]int{}}
+	mv := &mapView{
+		fields: map[string]*yaml.Node{},
+		lines:  map[string]int{},
+	}
 	for i := 0; i+1 < len(n.Content); i += 2 {
 		k := n.Content[i]
 		v := n.Content[i+1]
@@ -52,18 +61,6 @@ func viewMap(n *yaml.Node) (*mapView, error) {
 	return mv, nil
 }
 
-func getScalarString(n *yaml.Node) (string, bool) {
-	if n != nil && n.Kind == yaml.ScalarNode {
-		return n.Value, true
-	}
-	return "", false
-}
-func getSequence(n *yaml.Node) ([]*yaml.Node, bool) {
-	if n != nil && n.Kind == yaml.SequenceNode {
-		return n.Content, true
-	}
-	return nil, false
-}
 func getMapping(n *yaml.Node) (*mapView, bool) {
 	if n != nil && n.Kind == yaml.MappingNode {
 		mv, err := viewMap(n)
@@ -75,18 +72,36 @@ func getMapping(n *yaml.Node) (*mapView, bool) {
 	return nil, false
 }
 
-// ---------- regex ----------
+func getSequence(n *yaml.Node) ([]*yaml.Node, bool) {
+	if n != nil && n.Kind == yaml.SequenceNode {
+		return n.Content, true
+	}
+	return nil, false
+}
+
+func getScalarString(n *yaml.Node) (string, bool) {
+	if n != nil && n.Kind == yaml.ScalarNode {
+		return n.Value, true
+	}
+	return "", false
+}
+
+// -------- правила/регэкспы --------
+
 var (
 	reSnakeCase = regexp.MustCompile(`^[a-z0-9]+(?:_[a-z0-9]+)*$`)
-	reImage     = regexp.MustCompile(`^registry\.bigbrother\.io\/[a-z0-9._\/-]+:[A-Za-z0-9._-]+$`)
-	reMem       = regexp.MustCompile(`^\d+(Gi|Mi|Ki)$`)
+	// registry.bigbrother.io/<path>:<tag>
+	reImage = regexp.MustCompile(`^registry\.bigbrother\.io\/[a-z0-9._\/-]+:[A-Za-z0-9._-]+$`)
+	// memory: 128Mi, 1Gi, 512Ki
+	reMem = regexp.MustCompile(`^\d+(Gi|Mi|Ki)$`)
 )
 
 func portInRange(p int) bool { return p > 0 && p < 65536 }
 
-// ---------- validators ----------
+// -------- валидации --------
 
 func validateTop(v *vCtx, root *yaml.Node) {
+	// ожидаем DocumentNode с одним корневым объектом
 	if root == nil || root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
 		v.addErr(nil, "document is required")
 		return
@@ -98,34 +113,39 @@ func validateTop(v *vCtx, root *yaml.Node) {
 		v.addErr(&line, "document must be mapping")
 		return
 	}
-	// apiVersion
-	apiNode, ok := mv.fields["apiVersion"]
+
+	// apiVersion (required, "v1")
+	api, ok := mv.fields["apiVersion"]
 	if !ok {
 		v.addErr(nil, "apiVersion is required")
-	} else if s, ok := getScalarString(apiNode); !ok {
-		line := apiNode.Line
+	} else if s, ok := getScalarString(api); !ok {
+		line := api.Line
 		v.addErr(&line, "apiVersion must be string")
 	} else if s != "v1" {
-		line := apiNode.Line
+		line := api.Line
 		v.addErr(&line, fmt.Sprintf("apiVersion has unsupported value '%s'", s))
 	}
-	// kind
-	kindNode, ok := mv.fields["kind"]
+
+	// kind (required, "Pod")
+	kind, ok := mv.fields["kind"]
 	if !ok {
 		v.addErr(nil, "kind is required")
-	} else if s, ok := getScalarString(kindNode); !ok {
-		line := kindNode.Line
+	} else if s, ok := getScalarString(kind); !ok {
+		line := kind.Line
 		v.addErr(&line, "kind must be string")
 	} else if s != "Pod" {
-		line := kindNode.Line
+		line := kind.Line
 		v.addErr(&line, fmt.Sprintf("kind has unsupported value '%s'", s))
 	}
-	// metadata/spec
+
+	// metadata (required)
 	if meta, ok := mv.fields["metadata"]; ok {
 		validateObjectMeta(v, meta)
 	} else {
 		v.addErr(nil, "metadata is required")
 	}
+
+	// spec (required)
 	if spec, ok := mv.fields["spec"]; ok {
 		validatePodSpec(v, spec)
 	} else {
@@ -140,18 +160,21 @@ func validateObjectMeta(v *vCtx, n *yaml.Node) {
 		v.addErr(&line, "metadata must be object")
 		return
 	}
+	// name (required)
 	if name, ok := mv.fields["name"]; !ok {
 		v.addErr(nil, "metadata.name is required")
 	} else if _, ok := getScalarString(name); !ok {
 		line := name.Line
 		v.addErr(&line, "metadata.name must be string")
 	}
+	// namespace (optional)
 	if ns, ok := mv.fields["namespace"]; ok {
 		if _, ok := getScalarString(ns); !ok {
 			line := ns.Line
 			v.addErr(&line, "metadata.namespace must be string")
 		}
 	}
+	// labels (optional: map[string]string)
 	if labels, ok := mv.fields["labels"]; ok {
 		lmv, ok := getMapping(labels)
 		if !ok {
@@ -175,12 +198,15 @@ func validatePodSpec(v *vCtx, n *yaml.Node) {
 		v.addErr(&line, "spec must be object")
 		return
 	}
+
+	// os (optional): допускаем scalar или object{name: ...}
 	if osNode, ok := mv.fields["os"]; ok {
 		switch osNode.Kind {
 		case yaml.ScalarNode:
 			val := strings.ToLower(osNode.Value)
 			if val != "linux" && val != "windows" {
 				line := osNode.Line
+				// важно: короткое сообщение
 				v.addErr(&line, fmt.Sprintf("os has unsupported value '%s'", osNode.Value))
 			}
 		case yaml.MappingNode:
@@ -191,28 +217,34 @@ func validatePodSpec(v *vCtx, n *yaml.Node) {
 			} else if s, ok := getScalarString(nameNode); !ok {
 				line := nameNode.Line
 				v.addErr(&line, "name must be string")
-			} else if val := strings.ToLower(s); val != "linux" && val != "windows" {
-				line := nameNode.Line
-				v.addErr(&line, fmt.Sprintf("name has unsupported value '%s'", s))
+			} else {
+				val := strings.ToLower(s)
+				if val != "linux" && val != "windows" {
+					line := nameNode.Line
+					// коротко
+					v.addErr(&line, fmt.Sprintf("name has unsupported value '%s'", s))
+				}
 			}
 		default:
 			line := osNode.Line
 			v.addErr(&line, "os must be string or object")
 		}
 	}
-	contNode, ok := mv.fields["containers"]
+
+	// containers (required, non-empty array)
+	cn, ok := mv.fields["containers"]
 	if !ok {
 		v.addErr(nil, "spec.containers is required")
 		return
 	}
-	seq, ok := getSequence(contNode)
+	seq, ok := getSequence(cn)
 	if !ok {
-		line := contNode.Line
+		line := cn.Line
 		v.addErr(&line, "spec.containers must be array")
 		return
 	}
 	if len(seq) == 0 {
-		line := contNode.Line
+		line := cn.Line
 		v.addErr(&line, "spec.containers must not be empty")
 	}
 	for _, c := range seq {
@@ -227,6 +259,8 @@ func validateContainer(v *vCtx, n *yaml.Node) {
 		v.addErr(&line, "containers[] must be object")
 		return
 	}
+
+	// name (required, snake_case)
 	if name, ok := mv.fields["name"]; !ok {
 		v.addErr(nil, "containers.name is required")
 	} else if s, ok := getScalarString(name); !ok {
@@ -236,6 +270,8 @@ func validateContainer(v *vCtx, n *yaml.Node) {
 		line := name.Line
 		v.addErr(&line, fmt.Sprintf("containers.name has invalid format '%s'", s))
 	}
+
+	// image (required, registry.bigbrother.io + tag)
 	if img, ok := mv.fields["image"]; !ok {
 		v.addErr(nil, "containers.image is required")
 	} else if s, ok := getScalarString(img); !ok {
@@ -245,6 +281,8 @@ func validateContainer(v *vCtx, n *yaml.Node) {
 		line := img.Line
 		v.addErr(&line, fmt.Sprintf("containers.image has invalid format '%s'", s))
 	}
+
+	// ports (optional) — array of ContainerPort
 	if ports, ok := mv.fields["ports"]; ok {
 		if seq, ok := getSequence(ports); ok {
 			for _, p := range seq {
@@ -255,12 +293,16 @@ func validateContainer(v *vCtx, n *yaml.Node) {
 			v.addErr(&line, "ports must be array")
 		}
 	}
+
+	// probes (optional)
 	if rp, ok := mv.fields["readinessProbe"]; ok {
 		validateProbe(v, rp)
 	}
 	if lp, ok := mv.fields["livenessProbe"]; ok {
 		validateProbe(v, lp)
 	}
+
+	// resources (required)
 	if res, ok := mv.fields["resources"]; ok {
 		validateResources(v, res)
 	} else {
@@ -275,6 +317,8 @@ func validateContainerPort(v *vCtx, n *yaml.Node) {
 		v.addErr(&line, "ports must be object")
 		return
 	}
+
+	// containerPort (required, int in (0,65536))
 	cp, ok := mv.fields["containerPort"]
 	if !ok {
 		v.addErr(nil, "containerPort is required")
@@ -292,8 +336,11 @@ func validateContainerPort(v *vCtx, n *yaml.Node) {
 		v.addErr(&line, "containerPort must be int")
 	} else if !portInRange(val) {
 		line := cp.Line
-		v.addErr(&line, "containerPort value out of range")
+		// ВАЖНО: короткая формулировка, как в примерах
+		v.addErr(&line, "port value out of range")
 	}
+
+	// protocol (optional, TCP|UDP)
 	if proto, ok := mv.fields["protocol"]; ok {
 		if s, ok := getScalarString(proto); !ok {
 			line := proto.Line
@@ -309,6 +356,7 @@ func validateProbe(v *vCtx, n *yaml.Node) {
 	mv, ok := getMapping(n)
 	if !ok {
 		line := n.Line
+		// коротко
 		v.addErr(&line, "probe must be object")
 		return
 	}
@@ -327,6 +375,8 @@ func validateHTTPGet(v *vCtx, n *yaml.Node) {
 		v.addErr(&line, "httpGet must be object")
 		return
 	}
+
+	// path (required, absolute)
 	if path, ok := mv.fields["path"]; !ok {
 		v.addErr(nil, "path is required")
 	} else if s, ok := getScalarString(path); !ok {
@@ -336,6 +386,8 @@ func validateHTTPGet(v *vCtx, n *yaml.Node) {
 		line := path.Line
 		v.addErr(&line, fmt.Sprintf("path has invalid format '%s'", s))
 	}
+
+	// port (required, int in (0,65536))
 	if port, ok := mv.fields["port"]; !ok {
 		v.addErr(nil, "port is required")
 	} else if s, ok := getScalarString(port); !ok {
@@ -357,6 +409,7 @@ func validateResources(v *vCtx, n *yaml.Node) {
 	mv, ok := getMapping(n)
 	if !ok {
 		line := n.Line
+		// коротко
 		v.addErr(&line, "resources must be object")
 		return
 	}
@@ -393,11 +446,14 @@ func validateResourceSet(v *vCtx, n *yaml.Node) {
 				line := val.Line
 				v.addErr(&line, fmt.Sprintf("memory has invalid format '%s'", s))
 			}
+		default:
+			// неизвестные ресурсы — игнорируем (задание этого не запрещает)
 		}
 	}
 }
 
-// ---------- main ----------
+// -------- main --------
+
 func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s <path-to-yaml>\n", os.Args[0])
@@ -407,19 +463,23 @@ func main() {
 		flag.Usage()
 		os.Exit(2)
 	}
+
 	filename := flag.Arg(0)
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "%s: cannot read file content: %v\n", filename, err)
 		os.Exit(1)
 	}
+
 	var root yaml.Node
 	if err := yaml.Unmarshal(data, &root); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: cannot unmarshal file content: %v\n", filename, err)
 		os.Exit(1)
 	}
+
 	v := &vCtx{filename: filename}
 	validateTop(v, &root)
+
 	if v.hasErrs() {
 		v.flush()
 		os.Exit(1)
